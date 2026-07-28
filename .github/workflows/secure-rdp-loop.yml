@@ -11,6 +11,15 @@ on:
         description: "👤 اسم المستخدم (الافتراضي: rdpuser)"
         required: false
         default: "rdpuser"
+      # تحذير: إدخال هنا سيكون مرئياً في واجهة GitHub عند التشغيل — غير آمن لوضع أسرار حساسة
+      tailscale_auth_key:
+        description: "🔐 Tailscale auth key (اختياري — WARNING: مرئي عند التشغيل)"
+        required: false
+        default: ""
+      rdp_password:
+        description: "🔑 RDP password (اختياري — WARNING: مرئي عند التشغيل)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -24,7 +33,7 @@ jobs:
   secure-rdp:
     runs-on: windows-2025
     timeout-minutes: 400
-    
+
     steps:
       - name: 📋 التحقق من البيانات
         run: |
@@ -46,15 +55,48 @@ jobs:
           Remove-Item "$env:TEMP\ts.msi" -Force
           Write-Host "✅ تم التثبيت"
 
-      - name: 🔗 الاتصال بـ Tailscale
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      - name: 🧪 تحضير مفاتيح التشغيل (secrets أو inputs)
         run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-              Write-Error "❌ Secret TAILSCALE_AUTH_KEY غير موجود!"
-              exit 1
+          # حاول الحصول على المفتاح من Secrets أولاً ثم من مدخلات workflow_dispatch
+          $tailscaleKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if (-not $tailscaleKey -or $tailscaleKey -eq "") {
+            $tailscaleKey = "${{ github.event.inputs.tailscale_auth_key }}"
+            if ($tailscaleKey -and $tailscaleKey -ne "") {
+              Write-Host "⚠️ تستخدم قيمة TAILSCALE_AUTH_KEY المُدخلة يدوياً — هذا غير آمن"
+            }
+          } else {
+            Write-Host "✅ استخدام TAILSCALE_AUTH_KEY من GitHub Secrets"
           }
-          
+
+          $rdpPass = "${{ secrets.RDP_PASSWORD }}"
+          if (-not $rdpPass -or $rdpPass -eq "") {
+            $rdpPass = "${{ github.event.inputs.rdp_password }}"
+            if ($rdpPass -and $rdpPass -ne "") {
+              Write-Host "⚠️ تستخدم قيمة RDP_PASSWORD المُدخلة يدوياً — هذا غير آمن"
+            }
+          } else {
+            Write-Host "✅ استخدام RDP_PASSWORD من GitHub Secrets"
+          }
+
+          if (-not $tailscaleKey -or $tailscaleKey -eq "") {
+            Write-Error "❌ لم يتم توفير TAILSCALE_AUTH_KEY (إما كـ Secret أو كـ input عند التشغيل)"
+            exit 1
+          }
+          if (-not $rdpPass -or $rdpPass -eq "") {
+            Write-Error "❌ لم يتم توفير RDP_PASSWORD (إما كـ Secret أو كـ input عند التشغيل)"
+            exit 1
+          }
+
+          # نخزن في متغيّرات بيئة مؤقتة لاستخدامها في الخطوات التالية
+          Write-Host "إعداد المتغيرات البيئية المؤقتة..."
+          Write-Host ("::set-output name=tailscaleKey::" + $tailscaleKey)  # للـ steps القديمة، لكن نستخدم env file أدناه
+          $envFile = "$env:GITHUB_ENV"
+          Add-Content -Path $envFile -Value "TAILSCALE_AUTH_KEY=$tailscaleKey"
+          Add-Content -Path $envFile -Value "RDP_PASSWORD=$rdpPass"
+          Write-Host "✅ المتغيرات معدّة"
+
+      - name: 🔗 الاتصال بـ Tailscale
+        run: |
           Write-Host "🔐 الاتصال..."
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey="$env:TAILSCALE_AUTH_KEY" `
@@ -68,23 +110,42 @@ jobs:
       - name: 👤 إنشاء حساب RDP
         env:
           RDP_USERNAME: ${{ github.event.inputs.username }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $username = "$env:RDP_USERNAME"
-          
+          $username = ($env:RDP_USERNAME -replace '[^\w\.-]','').Trim()
+          if (-not $username) { $username = 'rdpuser' }
+
           if (-not $env:RDP_PASSWORD) {
-              Write-Error "❌ اضيف Secret باسم RDP_PASSWORD"
+              Write-Error "❌ RDP_PASSWORD غير موجود في البيئة"
               exit 1
           }
-          
-          $password = ConvertTo-SecureString "$env:RDP_PASSWORD" -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name $username -Password $password -AccountNeverExpires | Out-Null
+
+          # تحقق بسيط من تعقيد كلمة المرور (يمكنك تعديل القواعد حسب حاجتك)
+          $passwordPlain = $env:RDP_PASSWORD.Trim()
+          if ($passwordPlain.Length -lt 8) {
+              Write-Error "❌ RDP_PASSWORD قصير للغاية (اقل من 8 أحرف)"
+              exit 1
           }
-          
-          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-          Write-Host "✅ تم إنشاء الحساب"
+
+          try {
+              $password = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
+
+              $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+              if (-not $existing) {
+                  New-LocalUser -Name $username -Password $password -AccountNeverExpires | Out-Null
+                  Write-Host "✅ Created local user: $username"
+              } else {
+                  Write-Host "🔁 User $username already exists — updating password"
+                  Set-LocalUser -Name $username -Password $password
+              }
+
+              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+              Write-Host "✅ RDP account ready"
+          } catch {
+              Write-Error "❌ Failed to create/update local user: $($_.Exception.Message)"
+              exit 1
+          }
 
       - name: 🔐 تفعيل RDP بأمان
         run: |
@@ -112,7 +173,7 @@ jobs:
           Write-Host "════════════════════════════════════════"
           Write-Host "🖥️  السيرفر: $tsIP"
           Write-Host "👤 المستخدم: $username"
-          Write-Host "🔑 كلمة المرور: (موجودة في GitHub Secrets)"
+          Write-Host "🔑 كلمة المرور: (أدخلت أثناء التشغيل أو محفوظة في GitHub Secrets)"
           Write-Host "⏱️  المدة: $duration دقيقة"
           Write-Host "════════════════════════════════════════"
 
